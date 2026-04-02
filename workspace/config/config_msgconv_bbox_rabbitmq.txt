@@ -1,0 +1,37 @@
+[group_msgconv]
+schema-type=0 # 0 for full DeepStream schema, 1 for minimal, 2 for custom
+# Use PAYLOAD_DEEPSTREAM for detailed Protobuf messages,
+# or PAYLOAD_DEEPSTREAM_MINIMAL for a basic JSON structure,
+# or define a custom schema. For Python, JSON is often easier.
+
+# To send minimal JSON payload with specific fields:
+# msg-conv-payload-type=1 # Equivalent to schema-type=1
+#OR define which elements to include if using a more flexible schema approach (older versions might use this)
+# For example, to include specific object attributes in the message:
+#[object_attrs]
+# Set to 1 to include, 0 to exclude
+# These are examples, actual field names might vary based on DeepStream version/schema
+# Refer to DeepStream documentation for exact field names for msgconv
+#bbox=1
+# The 'bbox' field itself contains left, top, width, height.
+# If you need individual components at the top level of your JSON,
+# you might need a custom schema or process the 'bbox' object in Python.
+
+# Alternatively, using a schema that defines fields explicitly (common for newer DeepStream)
+[schema0]
+topic = bbox # If using multiple schemas/topics
+output-type = json # or protobuf
+
+#Define fields from NvDsObjectMeta (check DeepStream documentation for exact names)
+[schema0.property.object]
+frameId = $frame.frameNum
+sensorId = $frame.sensorId
+placeId = $frame.placeId
+componentId = $component.id
+objectId = $object.objectId
+classId = $object.classId
+confidence = $object.confidence
+bbox.left = $object.rectParams.left
+bbox.top = $object.rectParams.top
+bbox.width = $object.rectParams.width
+bbox.height = $object.rectParams.height

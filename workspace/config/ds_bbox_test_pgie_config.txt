@@ -1,0 +1,18 @@
+[property]
+gpu-id=0
+net-scale-factor=1.0
+# IMPORTANT: For actual detections, uncomment and provide valid paths below
+# model-engine-file=your_model.engine
+# onnx-file=your_model.onnx
+labelfile-path=ds_bbox_test_labels.txt
+# custom-lib-path=your_custom_parser.so
+# parse-bbox-func-name=YourCustomParserFunctionName
+num-detected-classes=1 # Should match the number of lines in labels.txt
+gie-unique-id=1
+network-type=0 # 0 for Detector
+process-mode=1 # Primary GIE
+batch-size=1
+
+[class-attrs-all]
+pre-cluster-threshold=0.2
+# Add other necessary nvinfer parameters for your specific model

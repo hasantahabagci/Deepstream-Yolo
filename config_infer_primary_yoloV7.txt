@@ -2,13 +2,13 @@
 gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
-onnx-file=yolov7.onnx
-model-engine-file=model_b1_gpu0_fp32.engine
+onnx-file=/home/ituarc/DeepStream-Yolo/workspace/models/01-04-2026-LEAF-YOLO-Drone-PrunedData.onnx
+model-engine-file=/home/ituarc/DeepStream-Yolo/workspace/models/model_b1_gpu0_fp32.engine
 #int8-calib-file=calib.table
-labelfile-path=labels.txt
+labelfile-path=/home/ituarc/DeepStream-Yolo/labels.txt
 batch-size=1
 network-mode=0
-num-detected-classes=80
+num-detected-classes=1
 interval=0
 gie-unique-id=1
 process-mode=1
@@ -19,10 +19,10 @@ symmetric-padding=1
 #workspace-size=2000
 parse-bbox-func-name=NvDsInferParseYolo
 #parse-bbox-func-name=NvDsInferParseYoloCuda
-custom-lib-path=nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+custom-lib-path=/home/ituarc/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 engine-create-func-name=NvDsInferYoloCudaEngineGet
 
 [class-attrs-all]
-nms-iou-threshold=0.45
+nms-iou-threshold=0.35
 pre-cluster-threshold=0.25
-topk=300
+topk=10

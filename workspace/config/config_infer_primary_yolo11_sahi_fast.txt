@@ -1,0 +1,29 @@
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+onnx-file=/home/ituarc/DeepStream-Yolo/workspace/models/Balloon_V11N_Last.pt.onnx
+model-engine-file=/home/ituarc/DeepStream-Yolo/workspace/models/model_b4_gpu0_fp16.engine
+labelfile-path=/home/ituarc/DeepStream-Yolo/labels.txt
+# Fast preset:
+# - batch-size 4 to match config_preprocess_sahi_fast.txt ROI count
+# - FP16 for higher throughput
+batch-size=4
+network-mode=2
+num-detected-classes=1
+interval=0
+gie-unique-id=1
+process-mode=1
+network-type=0
+cluster-mode=2
+maintain-aspect-ratio=1
+symmetric-padding=1
+crop-objects-to-roi-boundary=1
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=/home/ituarc/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+engine-create-func-name=NvDsInferYoloCudaEngineGet
+
+[class-attrs-all]
+nms-iou-threshold=0.45
+pre-cluster-threshold=0.35
+topk=300

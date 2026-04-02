@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.codex
+.codex/
+.onnx_engine_cache.json
+logs/
+
+!workspace/README.md
+nvdsinfer_custom_impl_Yolo/*.o
+nvdsinfer_custom_impl_Yolo/*.so
+nvdsinfer_custom_impl_Yolo/layers/*.o
+LEAF-YOLO/*
+tensorrt-python/*

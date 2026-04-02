@@ -1,0 +1,7 @@
+# Deprecated placeholder.
+# Use:
+# - deepstream_sahi_app.py
+# - config_preprocess_sahi.txt
+# - config_infer_primary_yolo11_sahi.txt
+#
+# There is no built-in "nvsahi" element in standard DeepStream.

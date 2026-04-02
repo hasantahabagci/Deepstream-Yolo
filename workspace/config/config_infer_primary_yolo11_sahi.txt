@@ -1,0 +1,33 @@
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+onnx-file=/home/ituarc/DeepStream-Yolo/workspace/models/Balloon_V11N_Last.pt.onnx
+model-engine-file=/home/ituarc/DeepStream-Yolo/workspace/models/model_b1_gpu0_fp32.engine
+#int8-calib-file=calib.table
+labelfile-path=/home/ituarc/DeepStream-Yolo/labels.txt
+# IMPORTANT:
+# For max SAHI FPS, export ONNX with dynamic batch and set batch-size
+# to ROI count from config_preprocess_sahi.txt (currently 7).
+# Also change model-engine-file to a new name when batch-size changes.
+batch-size=1
+network-mode=0
+num-detected-classes=1
+interval=10
+gie-unique-id=1
+process-mode=1
+network-type=0
+cluster-mode=2
+maintain-aspect-ratio=1
+symmetric-padding=1
+crop-objects-to-roi-boundary=1
+#workspace-size=2000
+parse-bbox-func-name=NvDsInferParseYolo
+#parse-bbox-func-name=NvDsInferParseYoloCuda
+custom-lib-path=/home/ituarc/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+engine-create-func-name=NvDsInferYoloCudaEngineGet
+
+[class-attrs-all]
+nms-iou-threshold=0.45
+pre-cluster-threshold=0.35
+topk=300

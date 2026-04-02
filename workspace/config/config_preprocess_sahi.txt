@@ -1,0 +1,40 @@
+################################################################################
+# Auto-generated SAHI-style nvdspreprocess config
+# Source: 1920x1080
+# Slice: 1024x1024
+# Overlap: width=0.2000, height=0.2000
+# ROI count: 7
+################################################################################
+
+[property]
+enable=1
+target-unique-ids=1
+network-input-order=0
+process-on-frame=1
+unique-id=15
+gpu-id=0
+maintain-aspect-ratio=1
+symmetric-padding=1
+processing-width=1024
+processing-height=1024
+scaling-buf-pool-size=16
+tensor-buf-pool-size=16
+network-input-shape=7;3;1024;1024
+network-color-format=0
+tensor-data-type=0
+tensor-name=input
+scaling-pool-memory-type=0
+scaling-pool-compute-hw=0
+scaling-filter=0
+custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/gst-plugins/libcustom2d_preprocess.so
+custom-tensor-preparation-function=CustomTensorPreparation
+
+[user-configs]
+pixel-normalization-factor=0.00392156862745
+
+[group-0]
+src-ids=0
+custom-input-transformation-function=CustomAsyncTransformation
+process-on-roi=1
+draw-roi=0
+roi-params-src-0=0;0;1024;1024;820;0;1024;1024;896;0;1024;1024;0;56;1024;1024;820;56;1024;1024;896;56;1024;1024;0;0;1920;1080

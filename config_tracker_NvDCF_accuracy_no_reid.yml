@@ -1,0 +1,62 @@
+%YAML:1.0
+####################################################################################################
+# Local fallback derived from NVIDIA's NvDCF accuracy preset.
+# ReID is intentionally disabled because the stock preset expects sample TAO assets under:
+# /opt/nvidia/deepstream/deepstream/samples/models/Tracker/
+####################################################################################################
+
+BaseConfig:
+  minDetectorConfidence: 0.1894
+
+TargetManagement:
+  enableBboxUnClipping: 1
+  preserveStreamUpdateOrder: 0
+  maxTargetsPerStream: 150
+
+  minIouDiff4NewTarget: 0.3686
+  minTrackerConfidence: 0.1513
+  probationAge: 2
+  maxShadowTrackingAge: 42
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+  enableReAssoc: 0
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  checkClassMatch: 1
+
+  minMatchingScore4Overall: 0.0222
+  minMatchingScore4SizeSimilarity: 0.3552
+  minMatchingScore4Iou: 0.0548
+  minMatchingScore4VisualSimilarity: 0.5043
+
+  matchingScoreWeight4VisualSimilarity: 0.3951
+  matchingScoreWeight4SizeSimilarity: 0.6003
+  matchingScoreWeight4Iou: 0.4033
+
+  tentativeDetectorConfidence: 0.1024
+  minMatchingScore4TentativeIou: 0.2852
+
+StateEstimator:
+  stateEstimatorType: 1
+
+  processNoiseVar4Loc: 6810.8668
+  processNoiseVar4Size: 1541.8647
+  processNoiseVar4Vel: 1348.4874
+  measurementNoiseVar4Detector: 100.0000
+  measurementNoiseVar4Tracker: 293.3238
+
+VisualTracker:
+  visualTrackerType: 1
+
+  useColorNames: 1
+  useHog: 1
+  featureImgSizeLevel: 3
+  featureFocusOffsetFactor_y: -0.1054
+
+  filterLr: 0.0767
+  filterChannelWeightsLr: 0.0339
+  gaussianSigma: 0.5687

@@ -1,0 +1,8 @@
+# cfg_redis.txt  (keep it next to deepstream_app_config.txt)
+[message-broker]
+hostname = 127.0.0.1      # IP of your Redis server
+port     = 6379
+payloadkey   = ds-meta     # Redis *stream* key
+consumergroup= ds-group
+consumername = jetson      # any name
+streamsize   = 10000  
