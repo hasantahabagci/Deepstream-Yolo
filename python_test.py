@@ -5,14 +5,14 @@ import os
 import sys
 import time
 import threading
+import queue as queue_module
 import signal
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import GObject, Gst, GLib
+from gi.repository import Gst, GLib
 import pyds
 import cv2
 import numpy as np
-import json
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -20,7 +20,7 @@ from rclpy._rclpy_pybind11 import RCLError
 from geometry_msgs.msg import Point, PointStamped
 from mavros_msgs.msg import State
 from sensor_msgs.msg import RegionOfInterest
-from redis_helper import RedisHelper
+from std_msgs.msg import Bool
 from moving_average import MovingAverage
 from project_paths import (
     PYTHON_TEST_OUTPUT_DIR,
@@ -29,43 +29,68 @@ from project_paths import (
     ROOT_TRACKER_FALLBACK_CONFIG,
 )
 
+try:
+    from jetson_power_logger import JetsonPowerLogger, plot_power_csv
+except Exception:
+    JetsonPowerLogger = None  # type: ignore
+    plot_power_csv = None  # type: ignore
+
 ma = MovingAverage(60)
 
-redis = RedisHelper()
 ros_node = None
 shutdown_event = threading.Event()
 
-focal_x = 1238.10428
-focal_y = 1238.78782  # Set focal length y
-c_x = 960
-c_y = 540
+power_logger = None
+power_logging_started = False
 
-RESOLUTION = (1920, 1080)  # Set resolution as per your config
+multiplier = 1.0
+
+PRIMARY_FOCAL_X = float(
+    os.getenv("PYTHON_TEST_PRIMARY_FOCAL_X", str(1238.10428 * multiplier))
+)
+PRIMARY_FOCAL_Y = float(
+    os.getenv("PYTHON_TEST_PRIMARY_FOCAL_Y", str(1238.78782 * multiplier))
+)
+SECONDARY_FOCAL_X = float(
+    os.getenv("PYTHON_TEST_SECONDARY_FOCAL_X", str(1988.47063182 * multiplier))
+)
+SECONDARY_FOCAL_Y = float(
+    os.getenv("PYTHON_TEST_SECONDARY_FOCAL_Y", str(1988.20715551 * multiplier))
+)
+SHARED_CX = float(os.getenv("PYTHON_TEST_CX", str(960 * multiplier)))
+SHARED_CY = float(os.getenv("PYTHON_TEST_CY", str(540 * multiplier)))
+
+RESOLUTION = (int(1920*multiplier), int(1080*multiplier))  # Set resolution as per your config
 
 display = os.getenv("PYTHON_TEST_DISPLAY", "0") == "1"
 ENABLE_HUD_RECORDING = os.getenv("PYTHON_TEST_RECORD_HUD", "1") == "1"
 ENABLE_RAW_RECORDING = os.getenv("PYTHON_TEST_RECORD_RAW", "1") == "1"
+ENABLE_ROI_RECORDING = os.getenv("PYTHON_TEST_RECORD_ROI", "0") == "1"
+LOW_LATENCY_MODE = os.getenv("PYTHON_TEST_LOW_LATENCY", "1") == "1"
 ENABLE_FULL_HUD = os.getenv("PYTHON_TEST_FULL_HUD", "0") == "1"
 DEBUG_PRINT_DETECTIONS = os.getenv("PYTHON_TEST_DEBUG_DETECTIONS", "0") == "1"
-ENABLE_SMALL_TARGET_PREPROCESS = os.getenv("PYTHON_TEST_PREPROCESS", "0") == "1"
 ENABLE_DYNAMIC_ROI_INFERENCE = os.getenv("PYTHON_TEST_DYNAMIC_ROI", "1") == "1"
-PREPROCESS_MODE = os.getenv("PYTHON_TEST_PREPROCESS_MODE", "roi").strip().lower()
-PREPROCESS_CLAHE_CLIP_LIMIT = float(os.getenv("PYTHON_TEST_PREPROCESS_CLAHE", "1.8"))
-PREPROCESS_CLAHE_GRID = max(1, int(os.getenv("PYTHON_TEST_PREPROCESS_TILE", "8")))
-PREPROCESS_GAMMA = max(0.1, float(os.getenv("PYTHON_TEST_PREPROCESS_GAMMA", "1.2")))
-PREPROCESS_SHARPEN = max(0.0, float(os.getenv("PYTHON_TEST_PREPROCESS_SHARPEN", "0.35")))
-PREPROCESS_INTERVAL = max(1, int(os.getenv("PYTHON_TEST_PREPROCESS_INTERVAL", "1")))
-PREPROCESS_ROI_SIZE = max(32, int(os.getenv("PYTHON_TEST_PREPROCESS_ROI", "320")))
-CAMERA_TNR_MODE = int(os.getenv("PYTHON_TEST_CAMERA_TNR_MODE", "1"))
-CAMERA_TNR_STRENGTH = float(os.getenv("PYTHON_TEST_CAMERA_TNR_STRENGTH", "0.15"))
-CAMERA_EE_MODE = int(os.getenv("PYTHON_TEST_CAMERA_EE_MODE", "1"))
-CAMERA_EE_STRENGTH = float(os.getenv("PYTHON_TEST_CAMERA_EE_STRENGTH", "0.2"))
+CAMERA_TNR_MODE = int(os.getenv("PYTHON_TEST_CAMERA_TNR_MODE", "0"))
+CAMERA_TNR_STRENGTH = float(os.getenv("PYTHON_TEST_CAMERA_TNR_STRENGTH", "0"))
+CAMERA_EE_MODE = int(os.getenv("PYTHON_TEST_CAMERA_EE_MODE", "0"))
+CAMERA_EE_STRENGTH = float(os.getenv("PYTHON_TEST_CAMERA_EE_STRENGTH", "0"))
 CAMERA_SATURATION = float(os.getenv("PYTHON_TEST_CAMERA_SATURATION", "1.0"))
 CAMERA_EXPOSURE_COMPENSATION = float(os.getenv("PYTHON_TEST_CAMERA_EXPOSURE_COMPENSATION", "0.0"))
 SOURCE_TYPE = os.getenv("PYTHON_TEST_SOURCE", "camera").strip().lower()
 VIDEO_SOURCE_PATH = os.getenv("PYTHON_TEST_VIDEO_PATH", "").strip()
+ALLOW_INFERENCE_WHILE_DEBUGGING = (
+    os.getenv("PYTHON_TEST_DEBUG_RUNS_INFERENCE", "1") == "1"
+)
+SKIP_ARMING_CHECK = os.getenv("PYTHON_TEST_SKIP_ARMING_CHECK", "0") == "1"
+DEBUGGER_ATTACHED = False
+DEBUG_INFERENCE_MODE = DEBUGGER_ATTACHED and ALLOW_INFERENCE_WHILE_DEBUGGING
+REQUIRE_ARM_FOR_INFERENCE = (
+    SOURCE_TYPE == "camera" and not (SKIP_ARMING_CHECK or DEBUG_INFERENCE_MODE)
+)
+PRIMARY_FLIP_METHOD = int(os.getenv("PYTHON_TEST_PRIMARY_FLIP_METHOD", "0"))
+SECONDARY_FLIP_METHOD = int(os.getenv("PYTHON_TEST_SECONDARY_FLIP_METHOD", "2"))
 
-FPS = 40
+FPS = 30
 INFERENCE_ROI_TOPIC = os.getenv(
     "PYTHON_TEST_ROI_TOPIC", "/interceptor/camera/inference_roi"
 ).strip() or "/interceptor/camera/inference_roi"
@@ -74,6 +99,10 @@ INFERENCE_ROI_TIMEOUT_SEC = max(
 )
 FRAME_INFERENCE_CONTEXT_LIMIT = max(32, FPS * 4)
 APP_CONFIG_PATH = str(ROOT_DEEPSTREAM_APP_CONFIG)
+PGIE_CONFIG_PATH = (
+    os.getenv("PYTHON_TEST_PGIE_CONFIG", str(ROOT_PGIE_CONFIG_YOLO26)).strip()
+    or str(ROOT_PGIE_CONFIG_YOLO26)
+)
 TRACKER_CONFIG_PATH = APP_CONFIG_PATH
 TRACKER_DEFAULT_WIDTH = 1920
 TRACKER_DEFAULT_HEIGHT = 1080
@@ -85,6 +114,21 @@ TRACKER_ACCURACY_REID_MODEL = "/opt/nvidia/deepstream/deepstream/samples/models/
 STREAMMUX_BATCHED_PUSH_TIMEOUT_USEC = 40_000
 UNTRACKED_OBJECT_ID = (1 << 64) - 1
 SELECTED_TRACK_MAX_MISSES = max(2, FPS // 8)
+LOW_LATENCY_QUEUE_SIZE = max(1, int(os.getenv("PYTHON_TEST_QUEUE_SIZE", "1")))
+ROI_RECORD_QUEUE_SIZE = max(1, int(os.getenv("PYTHON_TEST_ROI_RECORD_QUEUE", "1")))
+CAMERA_SWITCH_TOPIC = os.getenv(
+    "PYTHON_TEST_CAMERA_SWITCH_TOPIC", "/interceptor/camera/select_secondary"
+).strip() or "/interceptor/camera/select_secondary"
+PRIMARY_SENSOR_ID = int(os.getenv("PYTHON_TEST_PRIMARY_SENSOR_ID", "0"))
+SECONDARY_SENSOR_ID = int(os.getenv("PYTHON_TEST_SECONDARY_SENSOR_ID", "1"))
+PRIMARY_CAMERA_LABEL = (
+    os.getenv("PYTHON_TEST_PRIMARY_CAMERA_LABEL", f"CAM{PRIMARY_SENSOR_ID}").strip()
+    or f"CAM{PRIMARY_SENSOR_ID}"
+)
+SECONDARY_CAMERA_LABEL = (
+    os.getenv("PYTHON_TEST_SECONDARY_CAMERA_LABEL", f"CAM{SECONDARY_SENSOR_ID}").strip()
+    or f"CAM{SECONDARY_SENSOR_ID}"
+)
 
 HUD_DEFAULTS = {
     "offset": "0",
@@ -128,6 +172,7 @@ inference_roi_state = {
     "y_offset": None,
     "width": None,
     "height": None,
+    "roi_enabled": ENABLE_DYNAMIC_ROI_INFERENCE,
     "timestamp": 0.0,
 }
 
@@ -137,21 +182,233 @@ frame_inference_context = {}
 # Global variables for FPS calculation
 frame_count = 0
 start_time = time.time()
-fps_interval = 1  # Calculate FPS every 30 frames
+FPS_REPORT_INTERVAL_FRAMES = max(1, FPS)  # report about once per second
+fps_window_start_time = time.time()
+fps_last_reported = None
 selected_track_id = None
 selected_track_misses = 0
 hud_cache = HUD_DEFAULTS.copy()
-hud_cache_frame = -1
-preprocess_clahe = cv2.createCLAHE(
-    clipLimit=PREPROCESS_CLAHE_CLIP_LIMIT,
-    tileGridSize=(PREPROCESS_CLAHE_GRID, PREPROCESS_CLAHE_GRID),
-)
-gamma_inverse = 1.0 / PREPROCESS_GAMMA
-preprocess_gamma_lut = np.array(
-    [((i / 255.0) ** gamma_inverse) * 255 for i in range(256)],
-    dtype=np.uint8,
-)
-preprocess_warning_printed = False
+roi_inference_warning_printed = False
+roi_recorder = None
+roi_recording_output_path = None
+roi_recording_failed = False
+roi_recorder_lock = threading.Lock()
+camera_switch_lock = threading.Lock()
+camera_switch_state = {
+    "requested_secondary": False,
+    "topic_seen": False,
+    "active_secondary": False,
+    "idle_sync_pending": False,
+}
+camera_switch_runtime = {
+    "source": None,
+    "display_transform": None,
+    "raw_transform": None,
+    "pipeline_playing": False,
+    "switch_in_progress": False,
+}
+
+
+def _reset_selected_track():
+    global selected_track_id, selected_track_misses
+    selected_track_id = None
+    selected_track_misses = 0
+
+
+def _camera_label(use_secondary):
+    return SECONDARY_CAMERA_LABEL if use_secondary else PRIMARY_CAMERA_LABEL
+
+
+def _camera_sensor_id(use_secondary):
+    return SECONDARY_SENSOR_ID if use_secondary else PRIMARY_SENSOR_ID
+
+
+def _camera_intrinsics(use_secondary):
+    if use_secondary:
+        return SECONDARY_FOCAL_X, SECONDARY_FOCAL_Y, SHARED_CX, SHARED_CY
+    return PRIMARY_FOCAL_X, PRIMARY_FOCAL_Y, SHARED_CX, SHARED_CY
+
+
+def _camera_flip_method(use_secondary):
+    return SECONDARY_FLIP_METHOD if use_secondary else PRIMARY_FLIP_METHOD
+
+
+def get_active_camera_label():
+    with camera_switch_lock:
+        return _camera_label(bool(camera_switch_state["active_secondary"]))
+
+
+def get_active_camera_intrinsics():
+    if SOURCE_TYPE != "camera":
+        return _camera_intrinsics(False)
+
+    with camera_switch_lock:
+        use_secondary = bool(camera_switch_state["active_secondary"])
+    return _camera_intrinsics(use_secondary)
+
+
+def get_display_flip_method():
+    if SOURCE_TYPE != "camera":
+        return 0
+
+    with camera_switch_lock:
+        use_secondary = bool(camera_switch_state["active_secondary"])
+    return _camera_flip_method(use_secondary)
+
+
+def get_roi_inference_flip_method():
+    return get_display_flip_method()
+
+
+def get_roi_coordinate_flip_method():
+    return get_display_flip_method()
+
+
+def get_display_source_label():
+    if SOURCE_TYPE == "camera":
+        return get_active_camera_label()
+    return "4mm"
+
+
+def _compute_desired_secondary_locked():
+    if not camera_switch_state["topic_seen"]:
+        return bool(camera_switch_state["active_secondary"])
+
+    return bool(camera_switch_state["requested_secondary"])
+
+
+def _schedule_camera_switch_sync(reason="update"):
+    if SOURCE_TYPE != "camera":
+        return
+
+    with camera_switch_lock:
+        source = camera_switch_runtime["source"]
+        if source is None or camera_switch_state["idle_sync_pending"]:
+            return
+        camera_switch_state["idle_sync_pending"] = True
+
+    GLib.idle_add(_camera_switch_idle_sync, reason)
+
+
+def _set_gst_element_state(element, state, timeout_sec=5.0):
+    result = element.set_state(state)
+    if result == Gst.StateChangeReturn.FAILURE:
+        return False
+
+    if result == Gst.StateChangeReturn.ASYNC:
+        timeout_ns = int(timeout_sec * Gst.SECOND)
+        state_change, _current, _pending = element.get_state(timeout_ns)
+        return state_change != Gst.StateChangeReturn.FAILURE
+
+    return True
+
+
+def _apply_output_flip_method(use_secondary):
+    flip_method = _camera_flip_method(use_secondary)
+
+    with camera_switch_lock:
+        display_transform = camera_switch_runtime["display_transform"]
+        raw_transform = camera_switch_runtime["raw_transform"]
+
+    for transform in (display_transform, raw_transform):
+        if transform is None:
+            continue
+        if transform.find_property("flip-method") is not None:
+            transform.set_property("flip-method", int(flip_method))
+
+
+def _apply_camera_switch_if_needed(reason="update"):
+    if SOURCE_TYPE != "camera":
+        return False
+
+    with camera_switch_lock:
+        source = camera_switch_runtime["source"]
+        if source is None:
+            return False
+
+        desired_secondary = _compute_desired_secondary_locked()
+        active_secondary = bool(camera_switch_state["active_secondary"])
+        if desired_secondary == active_secondary:
+            return False
+
+        if camera_switch_runtime["switch_in_progress"]:
+            return False
+
+        target_sensor_id = _camera_sensor_id(desired_secondary)
+        active_sensor_id = _camera_sensor_id(active_secondary)
+        pipeline_playing = bool(camera_switch_runtime["pipeline_playing"])
+        camera_switch_runtime["switch_in_progress"] = True
+
+    try:
+        if not pipeline_playing:
+            source.set_property("sensor-id", int(target_sensor_id))
+        else:
+            if not _set_gst_element_state(source, Gst.State.NULL, timeout_sec=5.0):
+                raise RuntimeError("failed to stop camera source before sensor handover")
+
+            source.set_property("sensor-id", int(target_sensor_id))
+
+            if not _set_gst_element_state(source, Gst.State.PLAYING, timeout_sec=5.0):
+                raise RuntimeError("failed to restart camera source after sensor handover")
+    except Exception as exc:
+        print(
+            "Failed to hand over camera source "
+            f"(from sensor-id={active_sensor_id} to sensor-id={target_sensor_id}, "
+            f"reason={reason}): {exc}"
+        )
+        try:
+            source.set_property("sensor-id", int(active_sensor_id))
+            if pipeline_playing:
+                _set_gst_element_state(source, Gst.State.PLAYING, timeout_sec=5.0)
+        except Exception as restore_exc:
+            print(f"Failed to restore previous camera source after handover error: {restore_exc}")
+        finally:
+            with camera_switch_lock:
+                camera_switch_runtime["switch_in_progress"] = False
+        return False
+
+    with camera_switch_lock:
+        camera_switch_state["active_secondary"] = desired_secondary
+        camera_switch_runtime["switch_in_progress"] = False
+
+    _apply_output_flip_method(desired_secondary)
+    _reset_selected_track()
+    clear_latest_inference_roi()
+    print(
+        "Camera switch: active source -> "
+        f"{_camera_label(desired_secondary)} "
+        f"(sensor-id={_camera_sensor_id(desired_secondary)}, reason={reason})"
+    )
+
+    with camera_switch_lock:
+        needs_resync = (
+            _compute_desired_secondary_locked()
+            != bool(camera_switch_state["active_secondary"])
+        )
+    if needs_resync:
+        _schedule_camera_switch_sync("post-switch")
+
+    return True
+
+
+def _camera_switch_idle_sync(reason):
+    with camera_switch_lock:
+        camera_switch_state["idle_sync_pending"] = False
+    _apply_camera_switch_if_needed(reason)
+    return False
+
+
+def _reset_camera_switch_runtime():
+    with camera_switch_lock:
+        camera_switch_runtime["source"] = None
+        camera_switch_runtime["display_transform"] = None
+        camera_switch_runtime["raw_transform"] = None
+        camera_switch_runtime["pipeline_playing"] = False
+        camera_switch_runtime["switch_in_progress"] = False
+        camera_switch_state["requested_secondary"] = False
+        camera_switch_state["topic_seen"] = False
+        camera_switch_state["active_secondary"] = False
+        camera_switch_state["idle_sync_pending"] = False
 
 
 class NormalizedTargetPublisher(Node):
@@ -162,11 +419,17 @@ class NormalizedTargetPublisher(Node):
         self.roi_sub = self.create_subscription(
             RegionOfInterest, INFERENCE_ROI_TOPIC, self.roi_callback, 10
         )
+        self.camera_switch_sub = self.create_subscription(
+            Bool, CAMERA_SWITCH_TOPIC, self.camera_switch_callback, 10
+        )
         self.mavros_state_sub = self.create_subscription(
             State, "/mavros/state", self.mavros_state_callback, 10
         )
         self.was_armed = False
         self.shutdown_requested = False
+        self.inference_ready_event = threading.Event()
+        if not REQUIRE_ARM_FOR_INFERENCE:
+            self.inference_ready_event.set()
 
     def publish_target(self, x_bar, y_bar):
         if shutdown_event.is_set() or not rclpy.ok():
@@ -185,6 +448,8 @@ class NormalizedTargetPublisher(Node):
             pass
 
     def dkf_callback(self, msg):
+        focal_x, focal_y, c_x, c_y = get_active_camera_intrinsics()
+
         if not np.isfinite(msg.x) or not np.isfinite(msg.y):
             with dkf_lock:
                 dkf_overlay_state["pixel_x"] = None
@@ -207,39 +472,146 @@ class NormalizedTargetPublisher(Node):
             dkf_overlay_state["pbar_y"] = float(msg.y)
             dkf_overlay_state["timestamp"] = time.time()
 
-        redis.r.set("dkf_pixel_x", pixel_x)
-        redis.r.set("dkf_pixel_y", pixel_y)
-        redis.r.set("dkf_pbar_x", float(msg.x))
-        redis.r.set("dkf_pbar_y", float(msg.y))
-
     def roi_callback(self, msg):
-        if msg.width <= 0 or msg.height <= 0:
+        # Use RegionOfInterest.do_rectify as a runtime switch:
+        #   False => don't use ROI for inference (full frame)
+        #   True  => use ROI for inference
+        update_roi_enabled(bool(msg.do_rectify))
+
+        if not msg.do_rectify or msg.width <= 0 or msg.height <= 0:
             clear_latest_inference_roi()
             return
 
-        update_latest_inference_roi(
-            int(msg.x_offset),
-            int(msg.y_offset),
-            int(msg.width),
-            int(msg.height),
-        )
+        # Convert incoming rectangle ROI to a square ROI that keeps the
+        # incoming *rectangle* center and uses the larger edge length.
+        in_x = int(msg.x_offset)
+        in_y = int(msg.y_offset)
+        in_w = int(msg.width)
+        in_h = int(msg.height)
+
+        center_x = float(in_x) + (float(in_w) / 2.0)
+        center_y = float(in_y) + (float(in_h) / 2.0)
+        square_edge = int(max(in_w, in_h))
+
+        square_x = int(round(center_x - (float(square_edge) / 2.0)))
+        square_y = int(round(center_y - (float(square_edge) / 2.0)))
+
+        update_latest_inference_roi(square_x, square_y, square_edge, square_edge)
+
+    def camera_switch_callback(self, msg):
+        if shutdown_event.is_set():
+            return
+
+        with camera_switch_lock:
+            camera_switch_state["requested_secondary"] = bool(msg.data)
+            camera_switch_state["topic_seen"] = True
+
+        _schedule_camera_switch_sync("topic")
 
     def mavros_state_callback(self, msg):
         if shutdown_event.is_set() or self.shutdown_requested:
             self.was_armed = msg.armed
             return
 
-        if msg.armed:
-            self.was_armed = True
+        if not REQUIRE_ARM_FOR_INFERENCE:
+            self.was_armed = msg.armed
+            self.inference_ready_event.set()
             return
+
+        if msg.armed:
+            if not self.inference_ready_event.is_set():
+                self.get_logger().info(
+                    "Vehicle armed. Enabling inference and starting pipeline."
+                )
+                _start_power_logging(self)
+            self.was_armed = True
+            self.inference_ready_event.set()
+            return
+
+        self.inference_ready_event.clear()
 
         if self.was_armed and not msg.armed:
             self.shutdown_requested = True
-            redis.r.set("stop", "True")
             self.get_logger().info(
                 "Vehicle disarmed after arming. Sending SIGINT to stop python_test.py."
             )
+            _stop_power_logging(self)
             os.kill(os.getpid(), signal.SIGINT)
+
+
+def _start_power_logging(node: Node | None = None) -> None:
+    """Start Jetson power sampling in the background.
+
+    Best-effort: if telemetry files don't exist (non-Jetson), it logs a message
+    and continues without failing the main pipeline.
+    """
+
+    global power_logger, power_logging_started
+    if power_logging_started:
+        return
+
+    sample_hz = float(os.getenv("PYTHON_TEST_POWER_LOG_HZ", "5.0"))
+    enabled = os.getenv("PYTHON_TEST_POWER_LOG", "1") == "1"
+    if not enabled:
+        return
+
+    if JetsonPowerLogger is None:
+        if node is not None:
+            node.get_logger().warn(
+                "Power logging requested but jetson_power_logger import failed."
+            )
+        return
+
+    out_dir = str(PYTHON_TEST_OUTPUT_DIR)
+    power_logger = JetsonPowerLogger(output_dir=out_dir, sample_hz=sample_hz)
+    ok = power_logger.start()
+    if not ok:
+        power_logger = None
+        if node is not None:
+            node.get_logger().warn(
+                "jtop couldn't start; skipping power logging."
+            )
+        return
+
+    power_logging_started = True
+    if node is not None:
+        node.get_logger().info(
+            f"Started Jetson power logging via jtop ({sample_hz:.1f} Hz)."
+        )
+
+
+def _stop_power_logging(node: Node | None = None) -> None:
+    """Stop background power sampling, write CSV, and create plots."""
+
+    global power_logger, power_logging_started
+    if not power_logger or not power_logging_started:
+        return
+
+    try:
+        power_logger.stop()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        out_dir = str(PYTHON_TEST_OUTPUT_DIR)
+        csv_path = os.path.join(out_dir, f"jetson_power_{ts}.csv")
+        power_logger.write_csv(csv_path)
+
+        if plot_power_csv is not None:
+            plot_dir = os.path.join(out_dir, f"jetson_power_{ts}_plots")
+            written = plot_power_csv(csv_path, plot_dir)
+        else:
+            written = []
+
+        if node is not None:
+            node.get_logger().info(f"Power log saved: {csv_path}")
+            if written:
+                node.get_logger().info(
+                    f"Power plots saved: {os.path.dirname(written[0])}"
+                )
+    except Exception as e:
+        if node is not None:
+            node.get_logger().warn(f"Failed to finalize power log: {e}")
+    finally:
+        power_logger = None
+        power_logging_started = False
 
 
 def get_latest_dkf_pixel():
@@ -263,12 +635,85 @@ def clear_latest_inference_roi():
         inference_roi_state["timestamp"] = 0.0
 
 
-def update_latest_inference_roi(x_offset, y_offset, width, height):
+def update_roi_enabled(enabled: bool):
     with roi_lock:
-        inference_roi_state["x_offset"] = int(x_offset)
-        inference_roi_state["y_offset"] = int(y_offset)
-        inference_roi_state["width"] = int(width)
-        inference_roi_state["height"] = int(height)
+        inference_roi_state["roi_enabled"] = bool(enabled)
+
+
+def _transform_rect_for_flip(
+    left, top, width, height, frame_width, frame_height, flip_method
+):
+    if flip_method == 2:
+        return (
+            frame_width - (left + width),
+            frame_height - (top + height),
+            width,
+            height,
+        )
+    if flip_method == 4:
+        return frame_width - (left + width), top, width, height
+    if flip_method == 6:
+        return left, frame_height - (top + height), width, height
+    return left, top, width, height
+
+
+def _transform_bounds_for_flip(bounds, frame_width, frame_height, flip_method):
+    if bounds is None:
+        return None
+
+    left, top, right, bottom = bounds
+    width = right - left
+    height = bottom - top
+    transformed_left, transformed_top, transformed_width, transformed_height = (
+        _transform_rect_for_flip(
+            left,
+            top,
+            width,
+            height,
+            frame_width,
+            frame_height,
+            flip_method,
+        )
+    )
+    return _clamp_roi_bounds(
+        transformed_left,
+        transformed_top,
+        transformed_width,
+        transformed_height,
+        frame_width,
+        frame_height,
+    )
+
+
+def update_latest_inference_roi(x_offset, y_offset, width, height):
+    # Inputs follow sensor_msgs/RegionOfInterest: (x_offset, y_offset, width, height)
+    # Convert to bounds while preserving the *center* of the ROI.
+    width = int(width)
+    height = int(height)
+    center_x = float(x_offset) + (float(width) / 2.0)
+    center_y = float(y_offset) + (float(height) / 2.0)
+    roi_width = width
+    roi_height = height
+    roi_left = int(round(center_x - (roi_width / 2.0)))
+    roi_top = int(round(center_y - (roi_height / 2.0)))
+
+    transformed_left, transformed_top, transformed_width, transformed_height = (
+        _transform_rect_for_flip(
+            roi_left,
+            roi_top,
+            roi_width,
+            roi_height,
+            RESOLUTION[0],
+            RESOLUTION[1],
+            get_roi_coordinate_flip_method(),
+        )
+    )
+
+    with roi_lock:
+        inference_roi_state["x_offset"] = int(transformed_left)
+        inference_roi_state["y_offset"] = int(transformed_top)
+        inference_roi_state["width"] = int(transformed_width)
+        inference_roi_state["height"] = int(transformed_height)
         inference_roi_state["timestamp"] = time.time()
 
 
@@ -293,15 +738,16 @@ def _clamp_roi_bounds(left, top, width, height, frame_width, frame_height):
 
 
 def get_latest_inference_roi_bounds(frame_width, frame_height):
-    if not ENABLE_DYNAMIC_ROI_INFERENCE:
-        return None, None
-
     with roi_lock:
+        roi_enabled = bool(inference_roi_state.get("roi_enabled", False))
         timestamp = inference_roi_state["timestamp"]
         x_offset = inference_roi_state["x_offset"]
         y_offset = inference_roi_state["y_offset"]
         width = inference_roi_state["width"]
         height = inference_roi_state["height"]
+
+    if not roi_enabled:
+        return None, None
 
     if timestamp <= 0.0 or (time.time() - timestamp) > INFERENCE_ROI_TIMEOUT_SEC:
         return None, (
@@ -317,6 +763,16 @@ def get_latest_inference_roi_bounds(frame_width, frame_height):
         )
 
     return bounds, None
+
+
+def _flip_frame_for_inference(frame, flip_method):
+    if flip_method == 2:
+        return cv2.flip(frame, -1)
+    if flip_method == 4:
+        return cv2.flip(frame, 1)
+    if flip_method == 6:
+        return cv2.flip(frame, 0)
+    return frame
 
 
 def _store_frame_inference_context(frame_number, context):
@@ -353,6 +809,154 @@ def _discard_frame_inference_context(frame_number):
             frame_inference_context.pop(stale_frame, None)
 
 
+def _configure_queue_for_low_latency(queue_element, leaky=True):
+    if queue_element is None:
+        return
+
+    queue_element.set_property(
+        "max-size-buffers", LOW_LATENCY_QUEUE_SIZE if LOW_LATENCY_MODE else 4
+    )
+    queue_element.set_property("max-size-time", 0)
+    queue_element.set_property("max-size-bytes", 0)
+    if leaky and LOW_LATENCY_MODE:
+        queue_element.set_property("leaky", 2)
+
+
+class InferenceRoiRecorder:
+    def __init__(self, output_path, width, height, fps):
+        self.output_path = output_path
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = float(max(1, int(fps)))
+        self.frame_index = 0
+        self.dropped_frames = 0
+        self.closed = False
+        self._stop_sentinel = object()
+        self._frame_queue = queue_module.Queue(maxsize=ROI_RECORD_QUEUE_SIZE)
+        self.writer = cv2.VideoWriter(
+            self.output_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            self.fps,
+            (self.width, self.height),
+        )
+        if not self.writer.isOpened():
+            raise RuntimeError("Unable to open inference ROI video writer")
+        self.worker_thread = threading.Thread(
+            target=self._writer_loop,
+            name="inference-roi-recorder",
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _writer_loop(self):
+        while True:
+            frame = self._frame_queue.get()
+            if frame is self._stop_sentinel:
+                self._frame_queue.task_done()
+                break
+
+            try:
+                bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                self.writer.write(bgr_frame)
+                self.frame_index += 1
+            finally:
+                self._frame_queue.task_done()
+
+    def write_rgba_frame(self, rgba_frame):
+        if self.closed:
+            return
+
+        if rgba_frame is None or rgba_frame.ndim != 3 or rgba_frame.shape[2] < 4:
+            return
+
+        frame_copy = np.array(rgba_frame[:, :, :4], copy=True)
+        try:
+            self._frame_queue.put_nowait(frame_copy)
+        except queue_module.Full:
+            try:
+                stale_frame = self._frame_queue.get_nowait()
+                self._frame_queue.task_done()
+                if stale_frame is not self._stop_sentinel:
+                    self.dropped_frames += 1
+            except queue_module.Empty:
+                pass
+            self._frame_queue.put_nowait(frame_copy)
+
+    def close(self):
+        if self.closed:
+            return
+
+        self.closed = True
+        try:
+            self._frame_queue.put(self._stop_sentinel)
+            self.worker_thread.join(timeout=5.0)
+            self.writer.release()
+        except Exception:
+            pass
+        if self.frame_index > 0:
+            dropped_text = (
+                f" (dropped {self.dropped_frames} stale frames)"
+                if self.dropped_frames > 0
+                else ""
+            )
+            print(
+                f"Inference ROI recording saved {self.frame_index} frames to "
+                f"{self.output_path}{dropped_text}"
+            )
+
+
+def _ensure_inference_roi_recorder():
+    global roi_recorder
+    global roi_recording_failed
+
+    if not ENABLE_ROI_RECORDING or roi_recording_output_path is None or roi_recording_failed:
+        return None
+
+    with roi_recorder_lock:
+        if roi_recorder is not None:
+            return roi_recorder
+
+        try:
+            roi_recorder = InferenceRoiRecorder(
+                str(roi_recording_output_path),
+                RESOLUTION[0],
+                RESOLUTION[1],
+                FPS,
+            )
+        except Exception as exc:
+            print(f"Failed to start inference ROI recorder: {exc}")
+            roi_recording_failed = True
+            roi_recorder = None
+
+        return roi_recorder
+
+
+def _record_inference_roi_frame(rgba_frame):
+    recorder = _ensure_inference_roi_recorder()
+    if recorder is None:
+        return
+
+    try:
+        recorder.write_rgba_frame(rgba_frame)
+    except Exception as exc:
+        print(f"Failed to write inference ROI frame: {exc}")
+        _shutdown_inference_roi_recorder(disable=True)
+
+
+def _shutdown_inference_roi_recorder(disable=False):
+    global roi_recorder
+    global roi_recording_failed
+
+    with roi_recorder_lock:
+        recorder = roi_recorder
+        roi_recorder = None
+        if disable:
+            roi_recording_failed = True
+
+    if recorder is not None:
+        recorder.close()
+
+
 def get_log_number(path="/home/ituarc/ros2_ws/src/thermal_guidance/logs/last_log_id.txt"):
     try:
         with open(path, "r") as f:
@@ -362,113 +966,13 @@ def get_log_number(path="/home/ituarc/ros2_ws/src/thermal_guidance/logs/last_log
         return 0
 
 
-def decode_redis_value(value, default="0"):
-    if value is None:
-        return default
-
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return default
-
-    return str(value)
-
-
-def safe_redis_get_float(key, default=0.0):
-    try:
-        return float(decode_redis_value(redis.r.get(key), str(default)))
-    except (TypeError, ValueError):
-        return float(default)
-    except Exception:
-        return float(default)
-
-
 def refresh_hud_cache(frame_number):
-    global hud_cache, hud_cache_frame
-
-    if not ENABLE_FULL_HUD:
-        return
-
-    if hud_cache_frame >= 0 and (frame_number - hud_cache_frame) < max(1, FPS // 10):
-        return
-
-    try:
-        values = redis.r.mget(HUD_KEYS)
-    except Exception:
-        values = [None] * len(HUD_KEYS)
-
-    hud_cache = {
-        key: decode_redis_value(value, HUD_DEFAULTS[key])
-        for key, value in zip(HUD_KEYS, values)
-    }
-    hud_cache_frame = frame_number
+    # Redis integration removed; leave cached defaults as-is.
+    return
 
 
-def _get_preprocess_roi_bounds(frame_width, frame_height):
-    roi_size = min(PREPROCESS_ROI_SIZE, frame_width, frame_height)
-    half_roi = roi_size // 2
-
-    roi_center = get_latest_dkf_pixel()
-    if roi_center is None:
-        virt_x = safe_redis_get_float("pixel_x_virt", float("nan"))
-        virt_y = safe_redis_get_float("pixel_y_virt", float("nan"))
-        if np.isfinite(virt_x) and np.isfinite(virt_y):
-            roi_center = (int(round(virt_x)), int(round(virt_y)))
-
-    if roi_center is None:
-        return None
-
-    center_x = int(max(0, min(frame_width - 1, roi_center[0])))
-    center_y = int(max(0, min(frame_height - 1, roi_center[1])))
-    left = max(0, center_x - half_roi)
-    top = max(0, center_y - half_roi)
-    right = min(frame_width, left + roi_size)
-    bottom = min(frame_height, top + roi_size)
-    left = max(0, right - roi_size)
-    top = max(0, bottom - roi_size)
-    return left, top, right, bottom
-
-
-def enhance_small_target_rgba_inplace(rgba_frame, force_full_frame=False):
-    """
-    Boost local contrast for tiny airborne targets before primary inference.
-    This is intentionally mild so it helps the drone stand out without
-    destabilizing the detector with an overly synthetic image.
-    """
-    if PREPROCESS_MODE == "roi" and not force_full_frame:
-        roi_bounds = _get_preprocess_roi_bounds(rgba_frame.shape[1], rgba_frame.shape[0])
-        if roi_bounds is None:
-            return
-        left, top, right, bottom = roi_bounds
-        target_region = rgba_frame[top:bottom, left:right, :3]
-    else:
-        target_region = rgba_frame[:, :, :3]
-
-    rgb_frame = np.ascontiguousarray(target_region)
-    lab_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab_frame)
-    l_channel = preprocess_clahe.apply(l_channel)
-    l_channel = cv2.LUT(l_channel, preprocess_gamma_lut)
-    lab_frame = cv2.merge((l_channel, a_channel, b_channel))
-    enhanced_rgb = cv2.cvtColor(lab_frame, cv2.COLOR_LAB2RGB)
-
-    if PREPROCESS_SHARPEN > 0.0:
-        blurred = cv2.GaussianBlur(enhanced_rgb, (0, 0), sigmaX=1.1, sigmaY=1.1)
-        enhanced_rgb = cv2.addWeighted(
-            enhanced_rgb,
-            1.0 + PREPROCESS_SHARPEN,
-            blurred,
-            -PREPROCESS_SHARPEN,
-            0,
-        )
-
-    np.copyto(target_region, enhanced_rgb)
-
-
-def preprocess_sink_pad_buffer_probe(pad, info, u_data):
-    global ENABLE_DYNAMIC_ROI_INFERENCE, ENABLE_SMALL_TARGET_PREPROCESS
-    global preprocess_warning_printed
+def roi_inference_sink_pad_buffer_probe(pad, info, u_data):
+    global roi_inference_warning_printed
 
     if shutdown_event.is_set():
         return Gst.PadProbeReturn.OK
@@ -492,6 +996,7 @@ def preprocess_sink_pad_buffer_probe(pad, info, u_data):
             "frame_width": 0,
             "frame_height": 0,
             "roi_bounds": None,
+            "roi_flip_method": 0,
             "used_roi_inference": False,
             "warning_text": None,
             "restore_frame": None,
@@ -513,41 +1018,48 @@ def preprocess_sink_pad_buffer_probe(pad, info, u_data):
                 left, top, right, bottom = roi_bounds
                 roi_width = right - left
                 roi_height = bottom - top
+                roi_flip_method = get_roi_inference_flip_method()
                 frame_context["used_roi_inference"] = True
+                needs_crop_resize = (
+                    left != 0
+                    or top != 0
+                    or roi_width != frame_width
+                    or roi_height != frame_height
+                )
+                needs_roi_flip = roi_flip_method != 0
 
-                if left != 0 or top != 0 or roi_width != frame_width or roi_height != frame_height:
+                if needs_crop_resize or needs_roi_flip:
                     frame_context["restore_frame"] = np.array(rgba_frame, copy=True)
                     roi_frame = np.ascontiguousarray(rgba_frame[top:bottom, left:right, :])
-                    resized_roi = cv2.resize(
-                        roi_frame,
-                        (frame_width, frame_height),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                    np.copyto(rgba_frame, resized_roi)
 
-            should_run_small_target_preprocess = (
-                ENABLE_SMALL_TARGET_PREPROCESS
-                and (
-                    PREPROCESS_INTERVAL <= 1
-                    or frame_meta.frame_num % PREPROCESS_INTERVAL == 0
-                )
-            )
-            if should_run_small_target_preprocess:
-                enhance_small_target_rgba_inplace(
-                    rgba_frame, force_full_frame=frame_context["used_roi_inference"]
-                )
+                    if needs_roi_flip:
+                        roi_frame = _flip_frame_for_inference(roi_frame, roi_flip_method)
+                        frame_context["roi_flip_method"] = roi_flip_method
+
+                    if needs_crop_resize:
+                        roi_frame = cv2.resize(
+                            roi_frame,
+                            (frame_width, frame_height),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+
+                    np.copyto(rgba_frame, roi_frame)
+
+            if frame_context["used_roi_inference"] and ENABLE_ROI_RECORDING:
+                # Persist the exact ROI view that is fed into inference.
+                _record_inference_roi_frame(rgba_frame)
         except Exception as exc:
-            if not preprocess_warning_printed:
-                print(f"Inference preprocess path disabled after error: {exc}")
-                preprocess_warning_printed = True
+            if not roi_inference_warning_printed:
+                print(f"ROI inference path disabled after error: {exc}")
+                roi_inference_warning_printed = True
             frame_context["warning_text"] = (
-                "Preprocess error; full-frame inference fallback active"
+                "ROI inference error; full-frame inference fallback active"
             )
             frame_context["roi_bounds"] = None
+            frame_context["roi_flip_method"] = 0
             frame_context["used_roi_inference"] = False
             frame_context["restore_frame"] = None
-            ENABLE_DYNAMIC_ROI_INFERENCE = False
-            ENABLE_SMALL_TARGET_PREPROCESS = False
+            clear_latest_inference_roi()
         finally:
             _store_frame_inference_context(frame_meta.frame_num, frame_context)
             try:
@@ -581,17 +1093,31 @@ def _apply_bbox_to_object_meta(obj_meta, left, top, width, height):
             continue
 
 
-def _remap_bbox_from_roi(obj_meta, roi_bounds, frame_width, frame_height):
+def _remap_bbox_from_roi(
+    obj_meta, roi_bounds, frame_width, frame_height, roi_flip_method=0
+):
     left, top, right, bottom = roi_bounds
     roi_width = max(1.0, float(right - left))
     roi_height = max(1.0, float(bottom - top))
     scale_x = roi_width / max(1.0, float(frame_width))
     scale_y = roi_height / max(1.0, float(frame_height))
 
-    new_left = left + (obj_meta.rect_params.left * scale_x)
-    new_top = top + (obj_meta.rect_params.top * scale_y)
     new_width = obj_meta.rect_params.width * scale_x
     new_height = obj_meta.rect_params.height * scale_y
+
+    remapped_left = obj_meta.rect_params.left * scale_x
+    remapped_top = obj_meta.rect_params.top * scale_y
+
+    if roi_flip_method == 2:
+        remapped_left = roi_width - (remapped_left + new_width)
+        remapped_top = roi_height - (remapped_top + new_height)
+    elif roi_flip_method == 4:
+        remapped_left = roi_width - (remapped_left + new_width)
+    elif roi_flip_method == 6:
+        remapped_top = roi_height - (remapped_top + new_height)
+
+    new_left = left + remapped_left
+    new_top = top + remapped_top
 
     new_left = max(0.0, min(float(frame_width - 1), new_left))
     new_top = max(0.0, min(float(frame_height - 1), new_top))
@@ -623,6 +1149,7 @@ def pgie_src_pad_buffer_probe(pad, info, u_data):
         frame_context = _get_frame_inference_context(frame_meta.frame_num)
         if frame_context and frame_context.get("used_roi_inference"):
             roi_bounds = frame_context.get("roi_bounds")
+            roi_flip_method = int(frame_context.get("roi_flip_method", 0))
             frame_width = frame_context.get("frame_width", RESOLUTION[0])
             frame_height = frame_context.get("frame_height", RESOLUTION[1])
 
@@ -635,7 +1162,11 @@ def pgie_src_pad_buffer_probe(pad, info, u_data):
                         break
 
                     _remap_bbox_from_roi(
-                        obj_meta, roi_bounds, frame_width, frame_height
+                        obj_meta,
+                        roi_bounds,
+                        frame_width,
+                        frame_height,
+                        roi_flip_method=roi_flip_method,
                     )
 
                     try:
@@ -760,6 +1291,38 @@ def _on_video_pad_added(decodebin, pad, user_data):
     source_ctx["linked"] = True
 
 
+def _request_pad(element, template_name):
+    if hasattr(element, "request_pad_simple"):
+        return element.request_pad_simple(template_name)
+    return element.get_request_pad(template_name)
+
+
+def _create_camera_source_chain(sensor_id):
+    source = Gst.ElementFactory.make("nvarguscamerasrc", "camera-source")
+    caps_filter = Gst.ElementFactory.make("capsfilter", "camera-caps-filter")
+    queue = Gst.ElementFactory.make("queue", "camera-source-queue")
+
+    if not all([source, caps_filter, queue]):
+        return None, None, None
+
+    source.set_property("sensor-id", int(sensor_id))
+    source.set_property("tnr-mode", CAMERA_TNR_MODE)
+    source.set_property("tnr-strength", CAMERA_TNR_STRENGTH)
+    source.set_property("ee-mode", CAMERA_EE_MODE)
+    source.set_property("ee-strength", CAMERA_EE_STRENGTH)
+    source.set_property("saturation", CAMERA_SATURATION)
+    source.set_property("exposurecompensation", CAMERA_EXPOSURE_COMPENSATION)
+    caps_filter.set_property(
+        "caps",
+        Gst.Caps.from_string(
+            f"video/x-raw(memory:NVMM), width={RESOLUTION[0]}, height={RESOLUTION[1]}, "
+            f"format=NV12, framerate={FPS}/1"
+        ),
+    )
+    _configure_queue_for_low_latency(queue, leaky=False)
+    return source, caps_filter, queue
+
+
 def select_target_bbox(bboxes):
     global selected_track_id, selected_track_misses
 
@@ -797,16 +1360,22 @@ def select_target_bbox(bboxes):
 
 def calculate_fps():
     """Calculate and return current FPS"""
-    global frame_count, start_time
+    global frame_count, fps_window_start_time, fps_last_reported
     
     frame_count += 1
     
-    if frame_count % fps_interval == 0:
+    if frame_count % FPS_REPORT_INTERVAL_FRAMES == 0:
         current_time = time.time()
-        elapsed_time = current_time - start_time
-        fps = fps_interval / elapsed_time
-        start_time = current_time
+        elapsed_time = current_time - fps_window_start_time
+        if elapsed_time <= 0:
+            return None
+
+        fps = FPS_REPORT_INTERVAL_FRAMES / elapsed_time
+        fps_window_start_time = current_time
+        fps_last_reported = fps
         return fps
+
+    return None
 
 
 def configure_tracker(tracker, tracker_config_path=TRACKER_CONFIG_PATH):
@@ -889,7 +1458,8 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
         print("Unable to get GstBuffer ")
         return Gst.PadProbeReturn.OK
         
-    current_fps = calculate_fps() or 0.0
+    calculate_fps()
+    current_fps = fps_last_reported
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     l_frame = batch_meta.frame_meta_list
     
@@ -944,25 +1514,23 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
 
         target_bbox = select_target_bbox(bboxes)
         if target_bbox:
+            focal_x, focal_y, c_x, c_y = get_active_camera_intrinsics()
             center_x = target_bbox['left'] + target_bbox['width'] / 2
             center_y = target_bbox['top'] + target_bbox['height'] / 2
             # Normalized image coordinates with setting center as zero
             x_bar = (center_x - c_x) / focal_x
             y_bar = (center_y - c_y) / focal_y
 
-        if target_bbox and ros_node is not None:
+        # Publish only when we have a valid detection.
+        if (
+            target_bbox
+            and ros_node is not None
+            and x_bar is not None
+            and y_bar is not None
+            and np.isfinite(x_bar)
+            and np.isfinite(y_bar)
+        ):
             ros_node.publish_target(x_bar, y_bar)
-
-        # Redis'i en iyi bulunan kutu ile güncelle
-        bbox_payload = json.dumps(target_bbox) if target_bbox else json.dumps({})
-        try:
-            redis.r.set("bbox", bbox_payload)
-            redis.r.mset({
-                "frame_number": frame_number,
-                "cam_fps": current_fps,
-            })
-        except Exception:
-            pass
 
         # Görüntü metadatasını al
         display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
@@ -971,13 +1539,24 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
         frame_context = _get_frame_inference_context(frame_number) or {}
         warning_text = frame_context.get("warning_text")
         roi_bounds = frame_context.get("roi_bounds")
+        display_frame_width = int(frame_context.get("frame_width", RESOLUTION[0]))
+        display_frame_height = int(frame_context.get("frame_height", RESOLUTION[1]))
+        display_roi_bounds = _transform_bounds_for_flip(
+            roi_bounds,
+            display_frame_width,
+            display_frame_height,
+            get_display_flip_method(),
+        )
 
         display_meta.num_labels = 2 if warning_text else 1
         py_nvosd_text_params = display_meta.text_params[0]
         refresh_hud_cache(frame_number)
-        fps_vis = ma.update(current_fps)
+        fps_vis = ma.update(current_fps) if current_fps is not None else None
         fps_text = f" FPS: {fps_vis:.1f}" if fps_vis is not None else ""
-        display_text = f"Frame Number={frame_number} Number of Objects={num_rects}{fps_text} CAM: 4mm"
+        display_text = (
+            f"Frame Number={frame_number} Number of Objects={num_rects}"
+            f"{fps_text} CAM: {get_display_source_label()}"
+        )
         if ENABLE_FULL_HUD:
             display_text += (
                 f"\nDrone Mode: {hud_cache['drone_mode']}"
@@ -1018,29 +1597,11 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
 
         dkf_pixel = get_latest_dkf_pixel()
         next_line_index = 0
-        line_params = display_meta.line_params[next_line_index]
         next_line_index += 1
         
-        # Çizginin başlangıç noktası: ekranın merkezi
-        screen_center_x = RESOLUTION[0] // 2
-        screen_center_y = RESOLUTION[1] // 2
-        
-        # Çizginin bitiş noktası: hedef kutusunun merkezi
-        virt_x = safe_redis_get_float("pixel_x_virt", screen_center_x)
-        virt_y = safe_redis_get_float("pixel_y_virt", screen_center_y)
-        bbox_center_x = int(max(0, min(RESOLUTION[0] - 1, virt_x)))
-        bbox_center_y = int(max(0, min(RESOLUTION[1] - 1, virt_y)))
-        
-        # Çizgi parametrelerini ayarla
-        line_params.x1 = screen_center_x
-        line_params.y1 = screen_center_y
-        line_params.x2 = bbox_center_x
-        line_params.y2 = bbox_center_y
-        line_params.line_width = 2
-        line_params.line_color.set(1.0, 1.0, 0.0, 0.8)  # Sarı, hafif şeffaf
 
-        if roi_bounds is not None:
-            left, top, right, bottom = roi_bounds
+        if display_roi_bounds is not None:
+            left, top, right, bottom = display_roi_bounds
             roi_right = max(left, right - 1)
             roi_bottom = max(top, bottom - 1)
             roi_segments = (
@@ -1055,7 +1616,7 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
                 roi_line.y1 = int(y1)
                 roi_line.x2 = int(x2)
                 roi_line.y2 = int(y2)
-                roi_line.line_width = 2
+                roi_line.line_width = 4
                 roi_line.line_color.set(0.0, 0.8, 1.0, 0.9)
                 next_line_index += 1
 
@@ -1097,17 +1658,23 @@ def create_pipeline():
     """
     Create a DeepStream pipeline similar to your deepstream-app configuration
     """
+    global roi_recording_failed
+    global roi_recording_output_path
+
     # Initialize GStreamer
     Gst.init(None)
     
     # Create pipeline
     pipeline = Gst.Pipeline()
+    _reset_camera_switch_runtime()
     
     # --- Original Elements ---
     source = None
     caps_filter = None
+    queue_source = None
     streammux = Gst.ElementFactory.make("nvstreammux", "stream-muxer")
-    preprocess_enabled = ENABLE_DYNAMIC_ROI_INFERENCE or ENABLE_SMALL_TARGET_PREPROCESS
+    queue_mux_output = Gst.ElementFactory.make("queue", "queue-mux-output")
+    preprocess_enabled = ENABLE_DYNAMIC_ROI_INFERENCE
     preprocess_convert = (
         Gst.ElementFactory.make("nvvideoconvert", "preprocess-convert")
         if preprocess_enabled
@@ -1120,6 +1687,7 @@ def create_pipeline():
     )
     pgie = Gst.ElementFactory.make("nvinfer", "primary-nvinference-engine")
     tracker = Gst.ElementFactory.make("nvtracker", "object-tracker")
+    queue_tracker_output = Gst.ElementFactory.make("queue", "queue-tracker-output")
     nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "convertor")
     nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
     
@@ -1143,6 +1711,8 @@ def create_pipeline():
     # --- YENİ: Ham Video Kaydı İçin Elemanlar ---
     tee_raw_split = Gst.ElementFactory.make("tee", "tee-raw-split") if ENABLE_RAW_RECORDING else None
     queue_raw = Gst.ElementFactory.make("queue", "queue-raw-record") if ENABLE_RAW_RECORDING else None
+    queue_osd_input = Gst.ElementFactory.make("queue", "queue-osd-input") if ENABLE_RAW_RECORDING else None
+    nvvidconv_raw = Gst.ElementFactory.make("nvvideoconvert", "convertor-raw") if ENABLE_RAW_RECORDING else None
     encoder_raw = Gst.ElementFactory.make("nvv4l2h264enc", "encoder-raw") if ENABLE_RAW_RECORDING else None
     parser_raw = Gst.ElementFactory.make("h264parse", "parser-raw") if ENABLE_RAW_RECORDING else None
     container_raw = Gst.ElementFactory.make("mp4mux", "container-raw") if ENABLE_RAW_RECORDING else None
@@ -1150,8 +1720,16 @@ def create_pipeline():
     null_sink = Gst.ElementFactory.make("fakesink", "null-sink") if not display and not ENABLE_HUD_RECORDING else None
 
     if SOURCE_TYPE == "camera":
-        source = Gst.ElementFactory.make("nvarguscamerasrc", "camera-source")
-        caps_filter = Gst.ElementFactory.make("capsfilter", "caps-filter")
+        if PRIMARY_SENSOR_ID == SECONDARY_SENSOR_ID:
+            sys.stderr.write(
+                "PYTHON_TEST_PRIMARY_SENSOR_ID and PYTHON_TEST_SECONDARY_SENSOR_ID "
+                "must refer to different CSI sensors\n"
+            )
+            sys.exit(1)
+        with camera_switch_lock:
+            initial_secondary = _compute_desired_secondary_locked()
+        initial_sensor_id = _camera_sensor_id(initial_secondary)
+        source, caps_filter, queue_source = _create_camera_source_chain(initial_sensor_id)
     elif SOURCE_TYPE == "video":
         video_uri = _resolve_video_uri(VIDEO_SOURCE_PATH)
         if not video_uri:
@@ -1177,16 +1755,19 @@ def create_pipeline():
         )
         sys.exit(1)
 
-    if not all([source, streammux, pgie, tracker, nvvidconv, nvosd]):
+    if SOURCE_TYPE == "camera" and not all(
+        [source, caps_filter, queue_source, streammux, queue_mux_output, pgie, tracker, queue_tracker_output, nvvidconv, nvosd]
+    ):
+        sys.stderr.write("Unable to create camera source elements\n")
+        sys.exit(1)
+    elif SOURCE_TYPE == "video" and not all(
+        [source, streammux, queue_mux_output, pgie, tracker, queue_tracker_output, nvvidconv, nvosd]
+    ):
         sys.stderr.write("Unable to create essential elements\n")
         sys.exit(1)
 
-    if SOURCE_TYPE == "camera" and caps_filter is None:
-        sys.stderr.write("Unable to create camera caps filter\n")
-        sys.exit(1)
-
     if preprocess_enabled and not all([preprocess_convert, preprocess_caps]):
-        sys.stderr.write("Unable to create preprocessing elements\n")
+        sys.stderr.write("Unable to create ROI inference elements\n")
         sys.exit(1)
     
     if ENABLE_HUD_RECORDING and not all([queue2, encoder, parser, container, file_sink]):
@@ -1194,24 +1775,26 @@ def create_pipeline():
         sys.exit(1)
     
     # --- YENİ: Ham Kayıt Elemanları için Kontrol ---
-    if ENABLE_RAW_RECORDING and not all([tee_raw_split, queue_raw, encoder_raw, parser_raw, container_raw, file_sink_raw]):
+    if ENABLE_RAW_RECORDING and not all([
+        tee_raw_split,
+        queue_raw,
+        queue_osd_input,
+        nvvidconv_raw,
+        encoder_raw,
+        parser_raw,
+        container_raw,
+        file_sink_raw,
+    ]):
         sys.stderr.write("Unable to create Raw recording elements\n")
         sys.exit(1)
 
     # --- Özellikleri Ayarlama ---
+    initial_flip_method = 0
     if SOURCE_TYPE == "camera":
-        source.set_property("sensor-id", 0)
-        source.set_property("tnr-mode", CAMERA_TNR_MODE)
-        source.set_property("tnr-strength", CAMERA_TNR_STRENGTH)
-        source.set_property("ee-mode", CAMERA_EE_MODE)
-        source.set_property("ee-strength", CAMERA_EE_STRENGTH)
-        source.set_property("saturation", CAMERA_SATURATION)
-        source.set_property("exposurecompensation", CAMERA_EXPOSURE_COMPENSATION)
-        caps = Gst.Caps.from_string(
-            f"video/x-raw(memory:NVMM), width={RESOLUTION[0]}, height={RESOLUTION[1]}, format=NV12, framerate={FPS}/1"
-        )
-        caps_filter.set_property("caps", caps)
-    nvvidconv.set_property("flip-method", 2 if SOURCE_TYPE == "camera" else 0)
+        initial_flip_method = _camera_flip_method(bool(initial_secondary))
+    nvvidconv.set_property("flip-method", initial_flip_method)
+    if nvvidconv_raw is not None:
+        nvvidconv_raw.set_property("flip-method", initial_flip_method)
     if preprocess_caps is not None:
         preprocess_caps.set_property(
             "caps",
@@ -1227,22 +1810,19 @@ def create_pipeline():
         streammux.set_property("live-source", 1 if SOURCE_TYPE == "camera" else 0)
     streammux.set_property("batched-push-timeout", STREAMMUX_BATCHED_PUSH_TIMEOUT_USEC)
     
-    pgie.set_property("config-file-path", str(ROOT_PGIE_CONFIG_YOLO26))
+    pgie.set_property("config-file-path", PGIE_CONFIG_PATH)
     configure_tracker(tracker)
+    if LOW_LATENCY_MODE:
+        print(
+            "Low-latency mode enabled "
+            f"(queue-size={LOW_LATENCY_QUEUE_SIZE}, roi-record-queue={ROI_RECORD_QUEUE_SIZE})"
+        )
     if preprocess_enabled:
         print(
-            "Inference preprocess path enabled "
+            "ROI inference path enabled "
             f"(dynamic-roi={ENABLE_DYNAMIC_ROI_INFERENCE}, topic={INFERENCE_ROI_TOPIC}, "
             f"timeout={INFERENCE_ROI_TIMEOUT_SEC}s)"
         )
-        if ENABLE_SMALL_TARGET_PREPROCESS:
-            print(
-                "Small-target preprocess enabled "
-                f"(mode={PREPROCESS_MODE}, CLAHE={PREPROCESS_CLAHE_CLIP_LIMIT}, "
-                f"tile={PREPROCESS_CLAHE_GRID}, "
-                f"gamma={PREPROCESS_GAMMA}, sharpen={PREPROCESS_SHARPEN}, "
-                f"interval={PREPROCESS_INTERVAL}, roi={PREPROCESS_ROI_SIZE})"
-            )
     if SOURCE_TYPE == "camera":
         print(
             "Camera ISP tuning "
@@ -1250,32 +1830,45 @@ def create_pipeline():
             f"ee-mode={CAMERA_EE_MODE}, ee-strength={CAMERA_EE_STRENGTH}, "
             f"saturation={CAMERA_SATURATION}, exposure-comp={CAMERA_EXPOSURE_COMPENSATION})"
         )
+        print(
+            "Camera calibration "
+            f"(primary: fx={PRIMARY_FOCAL_X:.2f}, fy={PRIMARY_FOCAL_Y:.2f}, flip={PRIMARY_FLIP_METHOD}; "
+            f"secondary: fx={SECONDARY_FOCAL_X:.2f}, fy={SECONDARY_FOCAL_Y:.2f}, flip={SECONDARY_FLIP_METHOD}; "
+            f"cx={SHARED_CX:.2f}, cy={SHARED_CY:.2f})"
+        )
+        print(
+            "Camera switch enabled "
+            f"(topic={CAMERA_SWITCH_TOPIC}, latched-level, "
+            f"primary={PRIMARY_CAMERA_LABEL}/sensor-id={PRIMARY_SENSOR_ID}, "
+            f"secondary={SECONDARY_CAMERA_LABEL}/sensor-id={SECONDARY_SENSOR_ID}, "
+            "mode=exclusive-handover)"
+        )
     else:
         print(f"Video file source: {video_uri}")
     
     if display:
         display_sink.set_property("sync", False)
+        if LOW_LATENCY_MODE:
+            if display_sink.find_property("processing-deadline") is not None:
+                display_sink.set_property("processing-deadline", 0)
+            if display_sink.find_property("max-lateness") is not None:
+                display_sink.set_property("max-lateness", 0)
     
     if null_sink is not None and null_sink.find_property("sync") is not None:
         null_sink.set_property("sync", False)
     
+    _configure_queue_for_low_latency(queue_mux_output, leaky=LOW_LATENCY_MODE)
+    _configure_queue_for_low_latency(queue_tracker_output, leaky=LOW_LATENCY_MODE)
     if queue1 is not None:
-        queue1.set_property("max-size-buffers", 1)
-        queue1.set_property("max-size-time", 0)
-        queue1.set_property("max-size-bytes", 0)
-        queue1.set_property("leaky", 2)
+        _configure_queue_for_low_latency(queue1, leaky=True)
     if queue2 is not None:
-        queue2.set_property("max-size-buffers", 4)
-        queue2.set_property("max-size-time", 0)
-        queue2.set_property("max-size-bytes", 0)
-        queue2.set_property("leaky", 2)
+        _configure_queue_for_low_latency(queue2, leaky=True)
     
     # --- YENİ: Ham Kayıt Kuyruğu Özellikleri ---
     if queue_raw is not None:
-        queue_raw.set_property("max-size-buffers", 4)
-        queue_raw.set_property("max-size-time", 0)
-        queue_raw.set_property("max-size-bytes", 0)
-        queue_raw.set_property("leaky", 2)
+        _configure_queue_for_low_latency(queue_raw, leaky=True)
+    if queue_osd_input is not None:
+        _configure_queue_for_low_latency(queue_osd_input, leaky=True)
     
     # HUD video kayıt özellikleri
     if encoder is not None:
@@ -1285,7 +1878,9 @@ def create_pipeline():
     if encoder_raw is not None:
         encoder_raw.set_property("bitrate", 4000000)
     
-    if ENABLE_HUD_RECORDING or ENABLE_RAW_RECORDING:
+    roi_recording_output_path = None
+    roi_recording_failed = False
+    if ENABLE_HUD_RECORDING or ENABLE_RAW_RECORDING or ENABLE_ROI_RECORDING:
         log_number = get_log_number()
         if file_sink is not None:
             file_sink.set_property(
@@ -1297,18 +1892,28 @@ def create_pipeline():
                 "location",
                 str(PYTHON_TEST_OUTPUT_DIR / f"output_4mm_{log_number}_raw.mp4"),
             )
+        if ENABLE_ROI_RECORDING:
+            roi_recording_output_path = (
+                PYTHON_TEST_OUTPUT_DIR / f"output_4mm_{log_number}_roi.mp4"
+            )
+            print(f"Inference ROI recording enabled: {roi_recording_output_path}")
 
     # --- Boru Hattına Eleman Ekleme ---
     for element in [
         source,
         caps_filter,
+        queue_source,
         streammux,
+        queue_mux_output,
         preprocess_convert,
         preprocess_caps,
         pgie,
         tracker,
+        queue_tracker_output,
         nvvidconv,
         tee_raw_split,
+        queue_osd_input,
+        nvvidconv_raw,
         nvosd,
         tee,
         queue1,
@@ -1330,33 +1935,63 @@ def create_pipeline():
 
     # --- Elemanları Birbirine Bağlama ---
     if SOURCE_TYPE == "camera":
-        source.link(caps_filter)
+        if not source.link(caps_filter):
+            sys.stderr.write("Failed to link camera source -> capsfilter\n")
+            sys.exit(1)
+        if not caps_filter.link(queue_source):
+            sys.stderr.write("Failed to link camera capsfilter -> queue\n")
+            sys.exit(1)
+        sinkpad = _request_pad(streammux, "sink_0")
+        if sinkpad is None:
+            sys.stderr.write("Failed to request streammux sink pad\n")
+            sys.exit(1)
+        if (
+            queue_source.get_static_pad("src").link(sinkpad)
+            != Gst.PadLinkReturn.OK
+        ):
+            sys.stderr.write("Failed to link camera queue -> streammux\n")
+            sys.exit(1)
 
-        if hasattr(streammux, "request_pad_simple"):
-            sinkpad = streammux.request_pad_simple("sink_0")
-        else:
-            sinkpad = streammux.get_request_pad("sink_0")
-        srcpad = caps_filter.get_static_pad("src")
-        srcpad.link(sinkpad)
-    
+        with camera_switch_lock:
+            camera_switch_runtime["source"] = source
+            camera_switch_runtime["display_transform"] = nvvidconv
+            camera_switch_runtime["raw_transform"] = nvvidconv_raw
+            camera_switch_runtime["pipeline_playing"] = False
+            camera_switch_runtime["switch_in_progress"] = False
+            camera_switch_state["active_secondary"] = bool(initial_secondary)
+        _apply_output_flip_method(bool(initial_secondary))
+        print(
+            "Camera switch: active source -> "
+            f"{_camera_label(bool(initial_secondary))} "
+            f"(sensor-id={_camera_sensor_id(bool(initial_secondary))}, reason=startup)"
+        )
+    else:
+        pass
+
+    streammux.link(queue_mux_output)
+
     if preprocess_enabled:
-        streammux.link(preprocess_convert)
+        queue_mux_output.link(preprocess_convert)
         preprocess_convert.link(preprocess_caps)
         preprocess_caps.link(pgie)
     else:
-        streammux.link(pgie)
+        queue_mux_output.link(pgie)
     pgie.link(tracker)
-    tracker.link(nvvidconv)
+    tracker.link(queue_tracker_output)
     
     if ENABLE_RAW_RECORDING:
-        nvvidconv.link(tee_raw_split)
+        queue_tracker_output.link(tee_raw_split)
         tee_raw_split.link(queue_raw)
-        queue_raw.link(encoder_raw)
+        queue_raw.link(nvvidconv_raw)
+        nvvidconv_raw.link(encoder_raw)
         encoder_raw.link(parser_raw)
         parser_raw.link(container_raw)
         container_raw.link(file_sink_raw)
-        tee_raw_split.link(nvosd)
+        tee_raw_split.link(queue_osd_input)
+        queue_osd_input.link(nvvidconv)
+        nvvidconv.link(nvosd)
     else:
+        queue_tracker_output.link(nvvidconv)
         nvvidconv.link(nvosd)
 
     if display and ENABLE_HUD_RECORDING:
@@ -1384,7 +2019,7 @@ def create_pipeline():
     if preprocess_caps is not None:
         preprocess_pad = preprocess_caps.get_static_pad("src")
         preprocess_pad.add_probe(
-            Gst.PadProbeType.BUFFER, preprocess_sink_pad_buffer_probe, 0
+            Gst.PadProbeType.BUFFER, roi_inference_sink_pad_buffer_probe, 0
         )
     pgie_src_pad = pgie.get_static_pad("src")
     pgie_src_pad.add_probe(Gst.PadProbeType.BUFFER, pgie_src_pad_buffer_probe, 0)
@@ -1401,8 +2036,11 @@ def main():
     global ros_node
 
     # Initialize global timing variables
-    global start_time
+    global start_time, frame_count, fps_window_start_time, fps_last_reported
     start_time = time.time()
+    frame_count = 0
+    fps_window_start_time = start_time
+    fps_last_reported = None
 
     shutdown_event.clear()
     rclpy.init()
@@ -1429,6 +2067,10 @@ def main():
             return
 
         shutdown_event.set()
+        try:
+            _stop_power_logging(ros_node)
+        except Exception:
+            pass
         signal_name = signal.Signals(signum).name
         print(f"\nReceived {signal_name}, stopping pipeline...")
         GLib.idle_add(loop.quit)
@@ -1442,9 +2084,7 @@ def main():
             print("End of stream")
             loop.quit()
             
-        elif redis.r.get("stop").decode('utf-8') == "True":
-            print("Stopping pipeline as per Redis command")
-            loop.quit()
+    # Redis stop flag removed.
     
     bus.connect("message", on_message)
 
@@ -1454,45 +2094,70 @@ def main():
     signal.signal(signal.SIGTERM, request_shutdown)
 
     ros_thread = threading.Thread(target=spin_ros_node, daemon=True)
-    ros_thread.start()
-    
-    # Start pipeline
-    print("Starting pipeline...")
-    ret = pipeline.set_state(Gst.State.PLAYING)
-    if ret == Gst.StateChangeReturn.FAILURE:
-        print("Failed to start pipeline")
-        pipeline.set_state(Gst.State.NULL)
-        if ros_node is not None:
-            ros_node.destroy_node()
-            ros_node = None
-        if rclpy.ok():
-            rclpy.shutdown()
-        return
-    
-    if redis.r.get("stop").decode('utf-8') == "True":
-        print("Stopping pipeline as per Redis command")
-        loop.quit()
-    
+    pipeline_started = False
+
     try:
+        ros_thread.start()
+
+        if REQUIRE_ARM_FOR_INFERENCE:
+            print(
+                "Waiting for /mavros/state armed=True before starting inference..."
+            )
+            while (
+                not shutdown_event.is_set()
+                and not ros_node.inference_ready_event.wait(timeout=0.2)
+            ):
+                pass
+
+            if shutdown_event.is_set():
+                return
+        elif DEBUG_INFERENCE_MODE:
+            print("Debugger detected; starting inference without arming.")
+        elif SKIP_ARMING_CHECK:
+            print(
+                "PYTHON_TEST_SKIP_ARMING_CHECK=1; starting inference without arming."
+            )
+        elif SOURCE_TYPE != "camera":
+            print("Non-camera source selected; starting inference without arming.")
+
+        # Start pipeline
+        print("Starting pipeline...")
+        ret = pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print("Failed to start pipeline")
+            return
+
+        with camera_switch_lock:
+            camera_switch_runtime["pipeline_playing"] = True
+        pipeline_started = True
         loop.run()
     finally:
         shutdown_event.set()
-        # Send EOS event to properly close MP4 file
-        print("Sending EOS event to the pipeline...")
-        pipeline.send_event(Gst.Event.new_eos())
-        # Wait a bit for EOS to be processed
-        time.sleep(2)
-        # Print final statistics
-        total_time = time.time() - start_time
-        if total_time > 0:
-            print(f"Total frames processed: {frame_count}")
-            print(f"Total time: {total_time:.2f} seconds")
-            print(f"Average FPS: {frame_count / total_time:.2f}")
-        redis.r.set("stop", "False")
+        try:
+            _stop_power_logging(ros_node)
+        except Exception:
+            pass
+        if pipeline_started:
+            # Send EOS event to properly close MP4 file.
+            print("Sending EOS event to the pipeline...")
+            pipeline.send_event(Gst.Event.new_eos())
+            # Wait a bit for EOS to be processed.
+            time.sleep(2)
+            # Print final statistics.
+            total_time = time.time() - start_time
+            if total_time > 0:
+                print(f"Total frames processed: {frame_count}")
+                print(f"Total time: {total_time:.2f} seconds")
+                print(f"Average FPS: {frame_count / total_time:.2f}")
+        # Redis stop flag removed.
         
         # Cleanup
         print("Setting pipeline to NULL state...")
+        with camera_switch_lock:
+            camera_switch_runtime["pipeline_playing"] = False
         pipeline.set_state(Gst.State.NULL)
+        _reset_camera_switch_runtime()
+        _shutdown_inference_roi_recorder()
         bus.remove_signal_watch()
         if ros_node is not None:
             ros_node.destroy_node()
